@@ -195,7 +195,11 @@
 #define IR_TOLERANCE        20      // Toleranță % pentru comparare coduri IR
 #define IR_LONG_PRESS_MS    800     // Timp pentru apăsare lungă pe telecomandă (ms)
 #define IR_REPEAT_TIMEOUT   150     // Timeout pentru detectare repeat IR (ms)
-#define IR_NEC_REPEAT_CODE  0xFFFFFFFF  // NEC repeat code (ignorat)
+
+// NEC Repeat Code detection (pattern: ~9000µs + ~2250µs + ~560µs)
+#define NEC_REPEAT_BURST    9000    // Prima durată (burst) ~9ms
+#define NEC_REPEAT_SPACE    2250    // A doua durată (space) ~2.25ms  
+#define NEC_REPEAT_TOLERANCE 500    // Toleranță în µs pentru detectare repeat
 
 /*
  * ╔═══════════════════════════════════════════════════════════════════════════════╗
@@ -261,6 +265,7 @@ unsigned long irLearningStart = 0;
 unsigned long irLastReceived[2] = {0, 0};
 bool irLongPressActive[2] = {false, false};
 unsigned long irPressStart[2] = {0, 0};
+int8_t lastIRBulb = -1;                  // Ultimul bec care a primit cod IR valid (-1 = niciunul)
 
 // Pentru dimming ramp
 bool rampingUp = true;
@@ -828,13 +833,42 @@ bool compareIRCodes(uint16_t* received, uint8_t receivedLen, IRCode* stored) {
     return (matches * 100 / compareLen) >= 70;
 }
 
+/**
+ * @brief Detectează dacă buffer-ul conține un NEC repeat code
+ * 
+ * NEC repeat code: ~9000µs burst + ~2250µs space + ~560µs burst
+ * Total 3 timing-uri (sau 2 dacă ultimul nu e capturat)
+ * 
+ * @param buffer Array cu timing-uri
+ * @param len Lungime buffer
+ * @return true dacă e repeat code
+ */
+bool isNECRepeatCode(uint16_t* buffer, uint8_t len) {
+    // Repeat code are 2-4 timing-uri
+    if (len < 2 || len > 5) return false;
+    
+    // Verifică primul timing (~9000µs burst)
+    if (buffer[0] < NEC_REPEAT_BURST - NEC_REPEAT_TOLERANCE ||
+        buffer[0] > NEC_REPEAT_BURST + NEC_REPEAT_TOLERANCE) {
+        return false;
+    }
+    
+    // Verifică al doilea timing (~2250µs space)
+    if (buffer[1] < NEC_REPEAT_SPACE - NEC_REPEAT_TOLERANCE ||
+        buffer[1] > NEC_REPEAT_SPACE + NEC_REPEAT_TOLERANCE) {
+        return false;
+    }
+    
+    return true;
+}
+
 void processIRRemote() {
     if (irLearningMode) return; // În mod învățare, nu procesa ca telecomandă
     
     if (!irCodeReady) {
         // Verifică timeout recepție
         if (irReceiving && (micros() - irLastEdge > IR_TIMEOUT_US)) {
-            if (irBufferIndex >= IR_MIN_PULSES) {
+            if (irBufferIndex >= 2) {  // Minim 2 pentru repeat code
                 irCodeReady = true;
             }
             irReceiving = false;
@@ -853,9 +887,35 @@ void processIRRemote() {
     irBufferIndex = 0;
     interrupts();
     
-    // Verifică potrivirea cu fiecare bec
+    unsigned long now = millis();
+    
+    // Verifică dacă e NEC repeat code
+    if (isNECRepeatCode(tempBuffer, len)) {
+        // E repeat code - continuă apăsarea pe ultimul bec identificat
+        if (lastIRBulb >= 0 && lastIRBulb < 2) {
+            // Actualizează timestamp pentru a menține apăsarea activă
+            irLastReceived[lastIRBulb] = now;
+            
+            // Dacă apăsarea lungă e activă, continuă ramp
+            if (irLongPressActive[lastIRBulb]) {
+                handleLongPressHold(lastIRBulb, now);
+            }
+            // Verifică dacă a devenit apăsare lungă
+            else if (now - irPressStart[lastIRBulb] >= IR_LONG_PRESS_MS) {
+                irLongPressActive[lastIRBulb] = true;
+                handleLongPressStart(lastIRBulb);
+            }
+        }
+        return;
+    }
+    
+    // Nu e repeat code - verifică potrivirea cu codurile salvate
+    if (len < IR_MIN_PULSES) return;  // Cod prea scurt (nu e valid)
+    
     for (int i = 0; i < 2; i++) {
         if (compareIRCodes(tempBuffer, len, &bulb[i].irCode)) {
+            // Cod valid găsit - salvează care bec
+            lastIRBulb = i;
             handleIRCommand(i);
             break;
         }
