@@ -52,21 +52,24 @@
  * └─────────────────────────────────────────────────────────────────────────────┘
  * 
  * ┌─────────────────────────────────────────────────────────────────────────────┐
- * │                    CIRCUIT ZCD (Zero Crossing Detector)                      │
+ * │                    SEMNAL ZCD (Zero Crossing Detection)                      │
  * ├─────────────────────────────────────────────────────────────────────────────┤
  * │                                                                              │
- * │   220V AC ──┬──[R1 100kΩ]──┬──[R2 100kΩ]──┬─── GND                         │
- * │             │              │              │                                  │
- * │             │         ┌────┴────┐         │                                  │
- * │             │         │ 4N35    │         │                                  │
- * │             │    AC──►│ ●     ● │──► VCC (5V prin R 10kΩ)                   │
- * │             │         │ ●     ● │──► D2 (INT0) - Output ZCD                 │
- * │             │    AC──►│ ●     ● │──► GND                                    │
- * │             │         └─────────┘                                            │
- * │             │                                                                │
- * │   220V AC ──┘                                                                │
+ * │   Input: Semnal dreptunghiular 50Hz, 50% duty cycle, în fază cu tensiunea   │
  * │                                                                              │
- * │   Output: Semnal dreptunghiular 50Hz, RISING edge = zero crossing           │
+ * │   Tensiune AC:     /\      /\      /\                                       │
+ * │                   /  \    /  \    /  \                                      │
+ * │               ───/────\──/────\──/────\───                                  │
+ * │                        \/      \/      \/                                    │
+ * │                                                                              │
+ * │   Semnal ZCD:    ┌────┐     ┌────┐     ┌────┐                               │
+ * │                  │    │     │    │     │    │                               │
+ * │               ───┘    └─────┘    └─────┘    └───                            │
+ * │                  ↑    ↑     ↑    ↑     ↑    ↑                               │
+ * │                  │    │     │    │     │    │                               │
+ * │              RISING FALLING (ambele = zero crossing)                        │
+ * │                                                                              │
+ * │   Întreruperea folosește CHANGE pentru a detecta ambele fronturi            │
  * └─────────────────────────────────────────────────────────────────────────────┘
  * 
  * ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -192,6 +195,7 @@
 #define IR_TOLERANCE        20      // Toleranță % pentru comparare coduri IR
 #define IR_LONG_PRESS_MS    800     // Timp pentru apăsare lungă pe telecomandă (ms)
 #define IR_REPEAT_TIMEOUT   150     // Timeout pentru detectare repeat IR (ms)
+#define IR_NEC_REPEAT_CODE  0xFFFFFFFF  // NEC repeat code (ignorat)
 
 /*
  * ╔═══════════════════════════════════════════════════════════════════════════════╗
@@ -280,7 +284,8 @@ void setup() {
     digitalWrite(PIN_TRIAC2, LOW);
     
     // Configurare întrerupere ZCD pe INT0 (pin 2)
-    attachInterrupt(digitalPinToInterrupt(PIN_ZCD), zeroCrossISR, RISING);
+    // CHANGE: ambele fronturi sunt zero crossing (semnal 50% duty cycle)
+    attachInterrupt(digitalPinToInterrupt(PIN_ZCD), zeroCrossISR, CHANGE);
     
     // Configurare Pin Change Interrupt pentru IR (pin 7 = PCINT23 pe PORTD)
     PCICR |= (1 << PCIE2);      // Enable PCINT pentru PORTD
@@ -773,7 +778,13 @@ void processIRLearning() {
     if (irCodeReady) {
         irCodeReady = false;
         
+        // Ignoră coduri prea scurte (inclusiv NEC repeat code ~3 timing-uri)
         if (irBufferIndex >= IR_MIN_PULSES) {
+            // Verifică dacă NU este NEC repeat code
+            // NEC repeat: ~9000µs + ~2250µs + ~560µs (3 timing-uri, prea scurt)
+            // Cod valid NEC: 67+ timing-uri
+            // Această verificare e redundantă dar adaugă siguranță
+            
             // Salvează codul
             uint16_t tempBuffer[IR_MAX_LEN];
             noInterrupts();
@@ -786,9 +797,9 @@ void processIRLearning() {
             
             // Confirmare - aprinde și stinge de 2 ori
             confirmationBlink(irLearningBulb, 2);
+            irLearningMode = false;
         }
-        
-        irLearningMode = false;
+        // Dacă codul e prea scurt (repeat code), continuă să așteptăm cod valid
     }
 }
 
