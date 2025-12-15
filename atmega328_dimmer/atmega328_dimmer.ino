@@ -714,13 +714,15 @@ void handleLongPressStart(uint8_t bulbIndex) {
     button[bulbIndex].clickCount = 0;
     button[bulbIndex].waitingForMoreClicks = false;
     
-    // Dacă becul nu e aprins, îl aprinde la nivelul curent
-    if (!bulb[bulbIndex].isOn) {
-        bulb[bulbIndex].isOn = true;
-        bulb[bulbIndex].currentLevel = bulb[bulbIndex].savedLevel;
+    // Marchează becul ca aprins (pentru dimming)
+    bulb[bulbIndex].isOn = true;
+    
+    // Dacă nivelul curent e 0, pornește de la minim
+    if (bulb[bulbIndex].currentLevel == 0) {
+        bulb[bulbIndex].currentLevel = DIM_MIN;
     }
     
-    // Începe ramp up
+    // Începe ramp up de la nivelul curent
     rampingUp = true;
     lastRampStep = millis();
 }
