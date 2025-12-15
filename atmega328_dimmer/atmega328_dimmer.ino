@@ -274,6 +274,13 @@ unsigned long lastRampStep = 0;
 // Pentru sleep mode
 bool sleepEnabled = true;
 
+// Timer1 dimming - sincronizat cu ZCD
+// La 16MHz cu prescaler 8: 1 tick = 0.5µs, 20000 ticks = 10ms (half cycle)
+volatile uint16_t triacDelay[2] = {0xFFFF, 0xFFFF};  // Delay în ticks (0xFFFF = dezactivat)
+volatile uint8_t triacPhase = 0;    // Faza curentă: 0=idle, 1=wait_fire, 2=wait_pulse_end
+volatile uint8_t currentTriac = 0;  // Care triac e în curs de procesare
+volatile uint8_t nextTriac = 0xFF;  // Următorul triac de procesat (0xFF = niciunul)
+
 // ==================== FUNCȚII SETUP ====================
 void setup() {
     // Configurare pini
@@ -320,21 +327,92 @@ void setup() {
 }
 
 void setupTimer1() {
-    // Timer1 în mod CTC pentru timing precis al triacurilor
-    TCCR1A = 0;
-    TCCR1B = (1 << WGM12) | (1 << CS11); // CTC mode, prescaler 8
-    OCR1A = 20000; // Valoare inițială
-    TIMSK1 = 0; // Dezactivat inițial
+    // Timer1 în mod Normal pentru timing precis al triacurilor
+    // La 16MHz cu prescaler 8: 1 tick = 0.5µs
+    // Half cycle 50Hz = 10ms = 20000 ticks
+    
+    TCCR1A = 0;                         // Normal mode
+    TCCR1B = (1 << CS11);               // Prescaler 8, timer running
+    TCNT1 = 0;                          // Reset counter
+    OCR1A = 0xFFFF;                     // Compare A - canal 1
+    OCR1B = 0xFFFF;                     // Compare B - canal 2  
+    TIMSK1 = 0;                         // Întreruperi dezactivate inițial
+    TIFR1 = (1 << OCF1A) | (1 << OCF1B); // Clear pending interrupts
 }
 
 // ==================== ISR ZERO CROSSING ====================
 void zeroCrossISR() {
+    // SINCRONIZARE: Reset timer la fiecare zero crossing
+    TCNT1 = 0;
+    
+    // Oprește triacurile imediat (siguranță)
+    PORTD &= ~((1 << PIN_TRIAC1) | (1 << PIN_TRIAC2));  // Direct port pentru viteză
+    
+    // Dezactivează întreruperile timer temporar
+    TIMSK1 = 0;
+    
+    // Calculează delay-uri pentru fiecare canal
+    // Nivel 100% = delay mic (aprindere devreme = mai multă putere)
+    // Nivel 1% = delay mare (aprindere târziu = mai puțină putere)
+    // Range: 500 ticks (250µs) la 19000 ticks (9500µs)
+    
+    if (bulb[0].currentLevel > 0) {
+        triacDelay[0] = map(bulb[0].currentLevel, 1, 100, 19000, 500);
+    } else {
+        triacDelay[0] = 0xFFFF;  // Dezactivat
+    }
+    
+    if (bulb[1].currentLevel > 0) {
+        triacDelay[1] = map(bulb[1].currentLevel, 1, 100, 19000, 500);
+    } else {
+        triacDelay[1] = 0xFFFF;  // Dezactivat
+    }
+    
+    // Programează întreruperile Compare pentru fiecare canal
+    OCR1A = triacDelay[0];
+    OCR1B = triacDelay[1];
+    
+    // Clear pending interrupt flags și activează întreruperile
+    TIFR1 = (1 << OCF1A) | (1 << OCF1B);
+    
+    uint8_t timsk = 0;
+    if (triacDelay[0] != 0xFFFF) timsk |= (1 << OCIE1A);
+    if (triacDelay[1] != 0xFFFF) timsk |= (1 << OCIE1B);
+    TIMSK1 = timsk;
+    
+    // Flag pentru alte funcții (ramp, etc)
     zeroCrossing = true;
     lastZeroCross = micros();
+}
+
+// ==================== ISR TIMER1 COMPARE A (Triac 1) ====================
+ISR(TIMER1_COMPA_vect) {
+    // Aprinde triacul 1
+    PORTD |= (1 << PIN_TRIAC1);     // HIGH - direct port pentru viteză
     
-    // Oprește triacurile imediat la zero crossing
-    digitalWrite(PIN_TRIAC1, LOW);
-    digitalWrite(PIN_TRIAC2, LOW);
+    // Programează stingerea după TRIAC_PULSE_US
+    // 50µs = 100 ticks la 0.5µs/tick
+    OCR1A = TCNT1 + 100;
+    
+    // La următorul compare, vom stinge
+    // Dar pentru simplitate, folosim delayMicroseconds în ISR (scurt, acceptabil)
+    delayMicroseconds(TRIAC_PULSE_US);
+    PORTD &= ~(1 << PIN_TRIAC1);    // LOW
+    
+    // Dezactivează această întrerupere până la următorul ZCD
+    TIMSK1 &= ~(1 << OCIE1A);
+}
+
+// ==================== ISR TIMER1 COMPARE B (Triac 2) ====================
+ISR(TIMER1_COMPB_vect) {
+    // Aprinde triacul 2
+    PORTD |= (1 << PIN_TRIAC2);     // HIGH
+    
+    delayMicroseconds(TRIAC_PULSE_US);
+    PORTD &= ~(1 << PIN_TRIAC2);    // LOW
+    
+    // Dezactivează această întrerupere până la următorul ZCD
+    TIMSK1 &= ~(1 << OCIE1B);
 }
 
 // ==================== ISR PIN CHANGE (IR) ====================
@@ -451,162 +529,9 @@ void saveIRCode(uint8_t bulbIndex, uint16_t* timing, uint8_t length) {
     }
 }
 
-// ==================== FUNCȚII DIMMING ====================
-void updateDimming() {
-    if (!zeroCrossing) return;
-    zeroCrossing = false;
-    
-    // Calculează delay-ul pentru fiecare bec bazat pe nivelul de dimming
-    // Nivel 100% = delay minim, Nivel 0% = delay maxim (nu aprinde)
-    
-    for (int i = 0; i < 2; i++) {
-        if (bulb[i].currentLevel > 0) {
-            // Calculează delay-ul în microsecunde
-            // La nivel 100%, delay = ~0.5ms (aprindere aproape la zero crossing)
-            // La nivel 1%, delay = ~9.5ms (aprindere aproape la următorul zero crossing)
-            unsigned long delayTime = map(bulb[i].currentLevel, 1, 100, 
-                                          HALF_CYCLE_US - 500, 500);
-            
-            // Programează aprinderea triacului
-            delayMicroseconds(delayTime);
-            
-            if (i == 0) {
-                digitalWrite(PIN_TRIAC1, HIGH);
-            } else {
-                digitalWrite(PIN_TRIAC2, HIGH);
-            }
-            
-            delayMicroseconds(TRIAC_PULSE_US);
-            
-            if (i == 0) {
-                digitalWrite(PIN_TRIAC1, LOW);
-            } else {
-                digitalWrite(PIN_TRIAC2, LOW);
-            }
-        }
-    }
-}
+// ==================== FUNCȚII DIMMING ====================\n// NOTĂ: Timer1 se ocupă automat de aprinderea triacurilor.\n// Funcțiile de mai jos doar modifică bulb[].currentLevel,\n// iar ZCD ISR reprogramează timer-ul la fiecare zero crossing.\n\nvoid softStart(uint8_t bulbIndex) {\n    bulb[bulbIndex].isOn = true;\n    bulb[bulbIndex].targetLevel = bulb[bulbIndex].savedLevel;\n    \n    // Gradual ramp up - Timer1 se ocupă de dimming\n    while (bulb[bulbIndex].currentLevel < bulb[bulbIndex].targetLevel) {\n        bulb[bulbIndex].currentLevel++;\n        delay(SOFT_STEP_DELAY_MS);\n    }\n}
 
-// Varianta cu Timer pentru dimming mai precis (non-blocking)
-void scheduleDimming() {
-    if (!zeroCrossing) return;
-    zeroCrossing = false;
-    
-    unsigned long now = micros();
-    
-    for (int i = 0; i < 2; i++) {
-        if (bulb[i].currentLevel > 0) {
-            unsigned long delayTime = map(bulb[i].currentLevel, 1, 100, 
-                                          HALF_CYCLE_US - 500, 500);
-            
-            // Calculează timpul de aprindere
-            unsigned long fireTime = lastZeroCross + delayTime;
-            
-            // Așteaptă până la momentul aprinderii
-            while (micros() < fireTime) {
-                // Verifică dacă a trecut prea mult timp
-                if (micros() - lastZeroCross > HALF_CYCLE_US) break;
-            }
-            
-            // Aprinde triacul
-            if (i == 0) {
-                digitalWrite(PIN_TRIAC1, HIGH);
-                delayMicroseconds(TRIAC_PULSE_US);
-                digitalWrite(PIN_TRIAC1, LOW);
-            } else {
-                digitalWrite(PIN_TRIAC2, HIGH);
-                delayMicroseconds(TRIAC_PULSE_US);
-                digitalWrite(PIN_TRIAC2, LOW);
-            }
-        }
-    }
-}
-
-void softStart(uint8_t bulbIndex) {
-    bulb[bulbIndex].isOn = true;
-    bulb[bulbIndex].targetLevel = bulb[bulbIndex].savedLevel;
-    
-    // Gradual ramp up
-    while (bulb[bulbIndex].currentLevel < bulb[bulbIndex].targetLevel) {
-        bulb[bulbIndex].currentLevel++;
-        updateDimming();
-        delay(SOFT_STEP_DELAY_MS);
-        
-        // Procesează zero crossing în timpul ramp-ului
-        for (int i = 0; i < 5; i++) {
-            if (zeroCrossing) updateDimming();
-            delayMicroseconds(2000);
-        }
-    }
-}
-
-void softStop(uint8_t bulbIndex) {
-    // Gradual ramp down
-    while (bulb[bulbIndex].currentLevel > 0) {
-        bulb[bulbIndex].currentLevel--;
-        updateDimming();
-        delay(SOFT_STEP_DELAY_MS);
-        
-        // Procesează zero crossing în timpul ramp-ului
-        for (int i = 0; i < 5; i++) {
-            if (zeroCrossing) updateDimming();
-            delayMicroseconds(2000);
-        }
-    }
-    
-    bulb[bulbIndex].isOn = false;
-}
-
-void softRampTo(uint8_t bulbIndex, uint8_t targetLevel) {
-    while (bulb[bulbIndex].currentLevel != targetLevel) {
-        if (bulb[bulbIndex].currentLevel < targetLevel) {
-            bulb[bulbIndex].currentLevel++;
-        } else {
-            bulb[bulbIndex].currentLevel--;
-        }
-        
-        updateDimming();
-        delay(SOFT_STEP_DELAY_MS);
-        
-        // Procesează zero crossing
-        for (int i = 0; i < 5; i++) {
-            if (zeroCrossing) updateDimming();
-            delayMicroseconds(2000);
-        }
-    }
-}
-
-void confirmationBlink(uint8_t bulbIndex, uint8_t times) {
-    for (uint8_t t = 0; t < times; t++) {
-        // Soft on la maxim
-        while (bulb[bulbIndex].currentLevel < DIM_MAX) {
-            bulb[bulbIndex].currentLevel++;
-            updateDimming();
-            delay(SOFT_STEP_DELAY_MS / 2);
-            for (int i = 0; i < 3; i++) {
-                if (zeroCrossing) updateDimming();
-                delayMicroseconds(1500);
-            }
-        }
-        
-        delay(100);
-        
-        // Soft off
-        while (bulb[bulbIndex].currentLevel > 0) {
-            bulb[bulbIndex].currentLevel--;
-            updateDimming();
-            delay(SOFT_STEP_DELAY_MS / 2);
-            for (int i = 0; i < 3; i++) {
-                if (zeroCrossing) updateDimming();
-                delayMicroseconds(1500);
-            }
-        }
-        
-        if (t < times - 1) delay(200);
-    }
-    
-    bulb[bulbIndex].isOn = false;
-}
+void softStop(uint8_t bulbIndex) {\n    // Gradual ramp down - Timer1 se ocupă de dimming\n    while (bulb[bulbIndex].currentLevel > 0) {\n        bulb[bulbIndex].currentLevel--;\n        delay(SOFT_STEP_DELAY_MS);\n    }\n    \n    bulb[bulbIndex].isOn = false;\n}\n\nvoid softRampTo(uint8_t bulbIndex, uint8_t targetLevel) {\n    // Timer1 se ocupă de dimming\n    while (bulb[bulbIndex].currentLevel != targetLevel) {\n        if (bulb[bulbIndex].currentLevel < targetLevel) {\n            bulb[bulbIndex].currentLevel++;\n        } else {\n            bulb[bulbIndex].currentLevel--;\n        }\n        delay(SOFT_STEP_DELAY_MS);\n    }\n}\n\nvoid confirmationBlink(uint8_t bulbIndex, uint8_t times) {\n    for (uint8_t t = 0; t < times; t++) {\n        // Soft on la maxim\n        while (bulb[bulbIndex].currentLevel < DIM_MAX) {\n            bulb[bulbIndex].currentLevel++;\n            delay(SOFT_STEP_DELAY_MS / 2);\n        }\n        \n        delay(100);\n        \n        // Soft off\n        while (bulb[bulbIndex].currentLevel > 0) {\n            bulb[bulbIndex].currentLevel--;\n            delay(SOFT_STEP_DELAY_MS / 2);\n        }\n        \n        if (t < times - 1) delay(200);\n    }\n    \n    bulb[bulbIndex].isOn = false;\n}
 
 // ==================== FUNCȚII BUTOANE ====================
 void readButtons() {
@@ -1025,8 +950,8 @@ ISR(PCINT2_vect, ISR_ALIASOF(PCINT2_vect));
 
 // ==================== LOOP PRINCIPAL ====================
 void loop() {
-    // Procesează dimming la fiecare zero crossing
-    updateDimming();
+    // NOTĂ: Timer1 se ocupă automat de dimming sincronizat cu ZCD.
+    // Nu e nevoie să apelăm nimic pentru dimming în loop.
     
     // Citește și procesează butoanele
     readButtons();
